@@ -4,6 +4,7 @@ local api = vim.api
 M.ns = api.nvim_create_namespace("inlinediff")
 M.enabled = false
 M.last_diff_output = nil -- Cache to prevent unnecessary redraws
+M.last_diff_buf = nil -- Buffer id that `last_diff_output` corresponds to
 
 M.default_config = {
 	debounce_time = 200,
@@ -296,8 +297,8 @@ end
 -- 4. PUBLIC API
 --------------------------------------------------------------------------------
 
-M.refresh = function()
-	local bufnr = api.nvim_get_current_buf()
+M.refresh = function(bufnr)
+	bufnr = bufnr or api.nvim_get_current_buf()
 	if not M.enabled then
 		return
 	end
@@ -305,12 +306,15 @@ M.refresh = function()
 	run_git_diff(
 		bufnr,
 		vim.schedule_wrap(function(output)
-			-- Only redraw if the diff has actually changed
-			if output == M.last_diff_output then
+			-- Only redraw if the diff has actually changed for this buffer
+			if M.last_diff_buf == bufnr and output == M.last_diff_output then
 				return
 			end
 
+			-- Update cache for this buffer
 			M.last_diff_output = output
+			M.last_diff_buf = bufnr
+
 			api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
 
 			if not output or output == "" then
@@ -369,6 +373,18 @@ local function setup_autocmds()
 		group = augroup,
 		callback = debounced_refresh,
 	})
+
+	-- Clear cache when buffers unload or are deleted to avoid stale references
+	api.nvim_create_autocmd({ "BufUnload", "BufDelete" }, {
+		group = augroup,
+		callback = function(ctx)
+			local b = ctx.buf or ctx.bufnr
+			if M.last_diff_buf == b then
+				M.last_diff_buf = nil
+				M.last_diff_output = nil
+			end
+		end,
+	})
 end
 
 local function clear_autocmds()
@@ -390,11 +406,18 @@ function M.toggle()
 	if M.enabled then
 		M.enabled = false
 		M.last_diff_output = nil -- Clear cache on disable
+		M.last_diff_buf = nil
 		clear_autocmds()
-		api.nvim_buf_clear_namespace(0, M.ns, 0, -1)
+		-- Clear highlights/virt_lines in all loaded buffers
+		for _, b in ipairs(api.nvim_list_bufs()) do
+			if api.nvim_buf_is_loaded(b) then
+				pcall(api.nvim_buf_clear_namespace, b, M.ns, 0, -1)
+			end
+		end
 	else
 		M.enabled = true
 		M.last_diff_output = nil -- Clear cache on enable to force initial render
+		M.last_diff_buf = nil
 		setup_autocmds()
 		M.refresh()
 	end
