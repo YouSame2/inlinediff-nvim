@@ -62,7 +62,6 @@ local function run_git_diff(bufnr, cb)
 
 	local fullpath = vim.fn.fnamemodify(path, ":p")
 	local dir = vim.fn.fnamemodify(fullpath, ":h")
-	local name = vim.fn.fnamemodify(fullpath, ":t")
 
 	-- Read buffer (unsaved) content
 	local buf_lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
@@ -71,27 +70,74 @@ local function run_git_diff(bufnr, cb)
 		buf_content = buf_content .. "\n"
 	end
 
-	-- Try to read the index version of the file. If it fails (untracked/new file), treat index as empty.
-	local cmd = { "git", "show", ":./" .. name }
-	vim.system(cmd, { cwd = dir, text = true }, function(obj)
+	-- First, get the git repo root
+	vim.system({ "git", "rev-parse", "--show-toplevel" }, { cwd = dir, text = true }, function(root_obj)
 		local index_content = ""
-		if obj and obj.code == 0 and obj.stdout then
-			index_content = obj.stdout
+
+		-- If not in a git repo, treat index as empty (no error)
+		if not root_obj or root_obj.code ~= 0 then
+			-- Produce a unified diff between empty index and buffer
+			local diff_out = vim.diff(index_content, buf_content, {
+				algorithm = "minimal",
+				result_type = "unified",
+				ctxlen = 3,
+				interhunkctxlen = 4,
+			})
+
+			if diff_out and diff_out ~= "" then
+				cb(diff_out)
+			else
+				cb(nil)
+			end
+			return
 		end
 
-		-- Produce a unified diff between index (old) and buffer (new)
-		local diff_out = vim.diff(index_content, buf_content, {
-			algorithm = "minimal",
-			result_type = "unified",
-			ctxlen = 3,
-			interhunkctxlen = 4,
-		})
+		-- Compute repo-relative path
+		local repo_root = root_obj.stdout:gsub("\n$", "")
+		local real_fullpath = vim.loop.fs_realpath(fullpath)
+		local real_repo_root = vim.loop.fs_realpath(repo_root)
 
-		if diff_out and diff_out ~= "" then
-			cb(diff_out)
+		-- Fall back to string manipulation if fs_realpath fails
+		if not real_fullpath then
+			real_fullpath = fullpath
+		end
+		if not real_repo_root then
+			real_repo_root = repo_root
+		end
+
+		-- Compute relative path from repo root to file
+		local relpath
+		if real_fullpath:sub(1, #real_repo_root) == real_repo_root then
+			-- Remove repo_root prefix and leading slash
+			relpath = real_fullpath:sub(#real_repo_root + 1):gsub("^/", "")
 		else
-			cb(nil)
+			-- Fallback: use fnamemodify if path computation fails
+			relpath = vim.fn.fnamemodify(fullpath, ":t")
 		end
+
+		-- Try to read the index version using repo-relative path
+		-- Pass path as separate arg to avoid shell interpolation issues
+		-- Syntax: :<path> where path is relative to repo root
+		local cmd = { "git", "show", ":./" .. (relpath or "") }
+		vim.system(cmd, { cwd = repo_root, text = true }, function(obj)
+			if obj and obj.code == 0 and obj.stdout then
+				index_content = obj.stdout
+			end
+
+			-- Produce a unified diff between index (old) and buffer (new)
+			local diff_out = vim.diff(index_content, buf_content, {
+				algorithm = "minimal",
+				result_type = "unified",
+				ctxlen = 3,
+				interhunkctxlen = 4,
+			})
+
+			if diff_out and diff_out ~= "" then
+				cb(diff_out)
+			else
+				cb(nil)
+			end
+		end)
 	end)
 end
 
