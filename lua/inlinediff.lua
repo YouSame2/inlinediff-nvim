@@ -187,7 +187,10 @@ local function render_hunk(bufnr, hunk)
 	local p_new = {}
 
 	-- "Padding" to ensure highlights reach screen edge
-	local padding_text = string.rep(" ", 300)
+	-- Use window width when possible, with sensible fallbacks
+	local win_width = vim.api.nvim_win_get_width(0)
+	local padding_length = math.min(math.max(win_width, 40), 300)
+	local padding_text = string.rep(" ", padding_length)
 
 	local function flush_change()
 		if #p_old == 0 and #p_new == 0 then
