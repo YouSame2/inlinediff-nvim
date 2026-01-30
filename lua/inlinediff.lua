@@ -19,20 +19,20 @@ M.default_config = {
 }
 M.config = vim.deepcopy(M.default_config)
 
---------------------------------------------------------------------------------
--- 1. UTILS & COLORS
---------------------------------------------------------------------------------
+-- Constants for extmark priorities and rendering
+local PRIORITY_CONTEXT = 100
+local PRIORITY_CHANGE = 120
+local MIN_PADDING_LENGTH = 40
+local MAX_PADDING_LENGTH = 300
+
+local DIFF_PREFIX = { UNCHANGED = " ", DELETED = "-", ADDED = "+" }
 
 local function setup_highlights()
 	local c = M.config.colors
-	api.nvim_set_hl(0, "InlineDiffAddContext", { bg = c.InlineDiffAddContext, default = false })
-	api.nvim_set_hl(0, "InlineDiffAddChange", { bg = c.InlineDiffAddChange, default = false })
-	api.nvim_set_hl(0, "InlineDiffDeleteContext", { bg = c.InlineDiffDeleteContext, default = false })
-	api.nvim_set_hl(0, "InlineDiffDeleteChange", { bg = c.InlineDiffDeleteChange, default = false })
+	for name, color in pairs(c) do
+		api.nvim_set_hl(0, name, { bg = color, default = false })
+	end
 end
-
--- UTF-8 Safe Split
--- UTF-8 helpers: build char arrays and compute byte offsets using Neovim API
 local function build_char_array(s)
 	local chars = {}
 	local n = vim.str_utfindex(s, "utf-8") or 0
@@ -53,61 +53,53 @@ local function byte_map_for(s)
 	return map
 end
 
--- Lightweight buffer validity predicate used to avoid expensive work on
--- non-file-ish buffers (terminals, help, plugin prompts, unloaded buffers).
-local function is_buffer_valid(bufnr)
-	if not api.nvim_buf_is_valid(bufnr) then
-		return false
-	end
-
-	if not api.nvim_buf_is_loaded(bufnr) then
-		return false
-	end
-
-	-- Skip by buftype when non-empty (common special buffers). Also consult
-	-- user-supplied ignored_buftype for explicit matches.
-	local ok, buftype = pcall(api.nvim_buf_get_option, bufnr, "buftype")
-	if ok and buftype and buftype ~= "" then
-		for _, v in ipairs(M.config.ignored_buftype or {}) do
-			if buftype == v then
-				return false
-			end
-		end
-		-- If buftype is non-empty treat as special and skip.
-		return false
-	end
-
-	-- Block common UI/plugin filetypes when listed in config
-	local ok2, ft = pcall(api.nvim_buf_get_option, bufnr, "filetype")
-	if ok2 and ft and ft ~= "" then
-		for _, v in ipairs(M.config.ignored_filetype or {}) do
-			if ft == v then
-				return false
-			end
-		end
-	end
-
-	-- Prefer listed buffers; allow unnamed (new) buffers when listed and
-	-- modifiable (common for new unsaved buffers).
-	local ok3, bl = pcall(api.nvim_buf_get_option, bufnr, "buflisted")
-	if not ok3 or not bl then
-		return false
-	end
-
-	local name = api.nvim_buf_get_name(bufnr)
-	if name == "" then
-		local ok4, mod = pcall(api.nvim_buf_get_option, bufnr, "modifiable")
-		if not ok4 or not mod then
+local function is_in_list(value, list)
+	for _, v in ipairs(list or {}) do
+		if value == v then
 			return false
 		end
+	end
+	return true
+end
+
+local function is_buffer_valid(bufnr)
+	if not api.nvim_buf_is_valid(bufnr) or not api.nvim_buf_is_loaded(bufnr) then
+		return false
+	end
+
+	local ok, buftype = pcall(api.nvim_buf_get_option, bufnr, "buftype")
+	if ok and buftype ~= "" and not is_in_list(buftype, M.config.ignored_buftype) then
+		return false
+	end
+
+	local ok2, ft = pcall(api.nvim_buf_get_option, bufnr, "filetype")
+	if ok2 and ft ~= "" and not is_in_list(ft, M.config.ignored_filetype) then
+		return false
+	end
+
+	local ok3, listed = pcall(api.nvim_buf_get_option, bufnr, "buflisted")
+	if not ok3 or not listed then
+		return false
+	end
+
+	if api.nvim_buf_get_name(bufnr) == "" then
+		local ok4, mod = pcall(api.nvim_buf_get_option, bufnr, "modifiable")
+		return ok4 and mod
 	end
 
 	return true
 end
 
---------------------------------------------------------------------------------
--- 2. GIT SOURCE
---------------------------------------------------------------------------------
+local function compute_unified_diff(old_content, new_content)
+	local diff_out = vim.diff(old_content, new_content, {
+		algorithm = "minimal",
+		result_type = "unified",
+		ctxlen = 3,
+		interhunkctxlen = 4,
+	})
+
+	return (diff_out and diff_out ~= "") and diff_out or nil
+end
 
 local function run_git_diff(bufnr, cb)
 	local path = api.nvim_buf_get_name(bufnr)
@@ -116,84 +108,35 @@ local function run_git_diff(bufnr, cb)
 	end
 
 	local fullpath = vim.fn.fnamemodify(path, ":p")
-	local dir = vim.fn.fnamemodify(fullpath, ":h")
+	local buf_content = table.concat(api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n") .. "\n"
 
-	-- Read buffer (unsaved) content
-	local buf_lines = api.nvim_buf_get_lines(bufnr, 0, -1, false)
-	local buf_content = table.concat(buf_lines, "\n")
-	if buf_content == "" or buf_content:sub(-1) ~= "\n" then
-		buf_content = buf_content .. "\n"
-	end
+	vim.system(
+		{ "git", "rev-parse", "--show-toplevel" },
+		{ cwd = vim.fn.fnamemodify(fullpath, ":h"), text = true },
+		function(root_obj)
+			local index_content = ""
 
-	-- First, get the git repo root
-	vim.system({ "git", "rev-parse", "--show-toplevel" }, { cwd = dir, text = true }, function(root_obj)
-		local index_content = ""
-
-		-- If not in a git repo, treat index as empty (no error)
-		if not root_obj or root_obj.code ~= 0 then
-			-- Produce a unified diff between empty index and buffer
-			local diff_out = vim.diff(index_content, buf_content, {
-				algorithm = "minimal",
-				result_type = "unified",
-				ctxlen = 3,
-				interhunkctxlen = 4,
-			})
-
-			if diff_out and diff_out ~= "" then
-				cb(diff_out)
-			else
-				cb(nil)
-			end
-			return
-		end
-
-		-- Compute repo-relative path
-		local repo_root = root_obj.stdout:gsub("\n$", "")
-		local real_fullpath = vim.loop.fs_realpath(fullpath)
-		local real_repo_root = vim.loop.fs_realpath(repo_root)
-
-		-- Fall back to string manipulation if fs_realpath fails
-		if not real_fullpath then
-			real_fullpath = fullpath
-		end
-		if not real_repo_root then
-			real_repo_root = repo_root
-		end
-
-		-- Compute relative path from repo root to file
-		local relpath
-		if real_fullpath:sub(1, #real_repo_root) == real_repo_root then
-			-- Remove repo_root prefix and leading slash
-			relpath = real_fullpath:sub(#real_repo_root + 1):gsub("^/", "")
-		else
-			-- Fallback: use fnamemodify if path computation fails
-			relpath = vim.fn.fnamemodify(fullpath, ":t")
-		end
-
-		-- Try to read the index version using repo-relative path
-		-- Pass path as separate arg to avoid shell interpolation issues
-		-- Syntax: :<path> where path is relative to repo root
-		local cmd = { "git", "show", ":./" .. (relpath or "") }
-		vim.system(cmd, { cwd = repo_root, text = true }, function(obj)
-			if obj and obj.code == 0 and obj.stdout then
-				index_content = obj.stdout
+			if not root_obj or root_obj.code ~= 0 then
+				return cb(compute_unified_diff(index_content, buf_content))
 			end
 
-			-- Produce a unified diff between index (old) and buffer (new)
-			local diff_out = vim.diff(index_content, buf_content, {
-				algorithm = "minimal",
-				result_type = "unified",
-				ctxlen = 3,
-				interhunkctxlen = 4,
-			})
+			-- Compute repo-relative path
+			local repo_root = root_obj.stdout:gsub("\n$", "")
+			local real_fullpath = vim.loop.fs_realpath(fullpath) or fullpath
+			local real_repo_root = vim.loop.fs_realpath(repo_root) or repo_root
 
-			if diff_out and diff_out ~= "" then
-				cb(diff_out)
-			else
-				cb(nil)
-			end
-		end)
-	end)
+			local relpath = real_fullpath:sub(1, #real_repo_root) == real_repo_root
+					and real_fullpath:sub(#real_repo_root + 1):gsub("^/", "")
+				or vim.fn.fnamemodify(fullpath, ":t")
+
+			vim.system({ "git", "show", ":./" .. (relpath or "") }, { cwd = repo_root, text = true }, function(obj)
+				if obj and obj.code == 0 and obj.stdout then
+					index_content = obj.stdout
+				end
+				cb(compute_unified_diff(index_content, buf_content))
+			end)
+		end
+	)
 end
 
 local function parse_hunks(output)
@@ -231,215 +174,176 @@ local function parse_hunks(output)
 	return hunks
 end
 
---------------------------------------------------------------------------------
--- 3. CORE LOGIC & RENDERING
---------------------------------------------------------------------------------
+local function compute_char_diff(old_chars, new_chars)
+	if #old_chars == 0 or #new_chars == 0 then
+		return nil
+	end
+	return vim.diff(table.concat(old_chars, "\n"), table.concat(new_chars, "\n"), {
+		algorithm = "minimal",
+		result_type = "indices",
+		ctxlen = 0,
+		interhunkctxlen = 4,
+		indent_heuristic = false,
+		linematch = 0,
+	})
+end
 
-local function render_hunk(bufnr, hunk)
-	local buf_line_idx = hunk.new_start - 1 -- 0-based index in buffer
-
-	local p_old = {}
-	local p_new = {}
-
-	-- "Padding" to ensure highlights reach screen edge
-	-- Use window width when possible, with sensible fallbacks
-	local win_width = vim.api.nvim_win_get_width(0)
-	local padding_length = math.min(math.max(win_width, 40), 300)
-	local padding_text = string.rep(" ", padding_length)
-
-	local function flush_change()
-		if #p_old == 0 and #p_new == 0 then
-			return
+local function build_change_mask(diffs, idx)
+	local mask, count = {}, 0
+	for _, d in ipairs(diffs) do
+		for k = 0, d[idx + 1] - 1 do
+			mask[d[idx] + k] = true
+			count = count + 1
 		end
+	end
+	return mask, count
+end
 
-		-- Logic: 1-to-1 Pairing for precise diffs
-		-- Excess lines are strictly pure add/del (Dimmed)
-
-		local min_len = math.min(#p_old, #p_new)
-		local virts_old = {} -- List of { {text, hl}, ... }
-
-		-- 1. Initialize Old Map with Context (Dimmed) DEFAULT
-		for i, line_content in ipairs(p_old) do
-			virts_old[i] = { { line_content, "InlineDiffDeleteContext" } }
+local function build_highlight_chunks(chars, mask, ctx_hl, chg_hl)
+	local chunks, cur_hl, cur_txt = {}, nil, {}
+	for k, char in ipairs(chars) do
+		local hl = mask[k] and chg_hl or ctx_hl
+		if hl ~= cur_hl then
+			if #cur_txt > 0 then
+				table.insert(chunks, { table.concat(cur_txt), cur_hl })
+			end
+			cur_txt, cur_hl = { char }, hl
+		else
+			table.insert(cur_txt, char)
 		end
+	end
+	if #cur_txt > 0 then
+		table.insert(chunks, { table.concat(cur_txt), cur_hl })
+	end
+	return chunks
+end
 
-		-- 2. Apply Default Context Highlight to New Lines
-		for j = 0, #p_new - 1 do
-			local l = buf_line_idx + j
-			api.nvim_buf_set_extmark(bufnr, M.ns, l, 0, {
-				end_line = l + 1,
-				hl_group = "InlineDiffAddContext",
-				hl_eol = true,
-				priority = 100,
-			})
-		end
+local function apply_char_highlights(bufnr, virts_old, old_lines, new_lines, buf_line_idx, buf_lines_new)
+	for i = 1, math.min(#old_lines, #new_lines) do
+		local s_old, s_new = old_lines[i], buf_lines_new[i] or new_lines[i]
+		local c_old, c_new = build_char_array(s_old), build_char_array(s_new)
+		local diffs = compute_char_diff(c_old, c_new)
 
-		-- 3. Calculate Char Diffs for pairs
-		-- CRITICAL: Get actual buffer lines for NEW content to ensure byte offsets are correct
-		local buf_lines_new = {}
-		if #p_new > 0 then
-			buf_lines_new = api.nvim_buf_get_lines(bufnr, buf_line_idx, buf_line_idx + #p_new, false)
-		end
+		if diffs then
+			local old_mask, chgd_old = build_change_mask(diffs, 1)
+			if chgd_old < #c_old then
+				virts_old[i] =
+					build_highlight_chunks(c_old, old_mask, "InlineDiffDeleteContext", "InlineDiffDeleteChange")
+			end
 
-		for i = 1, min_len do
-			local s_old = p_old[i]
-			-- Use actual buffer content for NEW lines
-			local s_new = buf_lines_new[i] or p_new[i]
-			local c_old = build_char_array(s_old)
-			local c_new = build_char_array(s_new)
-
-			if #c_old > 0 and #c_new > 0 then
-				local diffs = vim.diff(table.concat(c_old, "\n"), table.concat(c_new, "\n"), {
-					algorithm = "minimal",
-					result_type = "indices",
-					ctxlen = 0,
-					interhunkctxlen = 4,
-					indent_heuristic = false,
-					linematch = 0,
-				})
-
-				if diffs then
-					-- A. OLD / DELETE Chunks
-					local old_mask = {}
-					local chgd_old = 0
-					for _, d in ipairs(diffs) do
-						local start, count = d[1], d[2]
-						for k = 0, count - 1 do
-							old_mask[start + k] = true
-							chgd_old = chgd_old + 1
-						end
-					end
-
-					-- Only show Bright if NOT a full line replacement
-					if chgd_old < #c_old then
-						local chunks = {}
-						local cur_hl, cur_txt = nil, {}
-						for k, char in ipairs(c_old) do
-							local hl = old_mask[k] and "InlineDiffDeleteChange" or "InlineDiffDeleteContext"
-							if hl ~= cur_hl then
-								if #cur_txt > 0 then
-									table.insert(chunks, { table.concat(cur_txt), cur_hl })
-								end
-								cur_txt = { char }
-								cur_hl = hl
-							else
-								table.insert(cur_txt, char)
-							end
-						end
-						if #cur_txt > 0 then
-							table.insert(chunks, { table.concat(cur_txt), cur_hl })
-						end
-						virts_old[i] = chunks
-					end
-
-					-- B. NEW / ADD Highlights
-					local new_mask = {}
-					local chgd_new = 0
-					for _, d in ipairs(diffs) do
-						local start, count = d[3], d[4]
-						for k = 0, count - 1 do
-							new_mask[start + k] = true
-							chgd_new = chgd_new + 1
-						end
-					end
-
-					-- Only show Bright if NOT a full line replacement
-					if chgd_new < #c_new then
-						local map = byte_map_for(s_new)
-						local abs_line = buf_line_idx + (i - 1)
-						for k = 1, #c_new do
-							if new_mask[k] then
-								local info = map[k]
-								api.nvim_buf_set_extmark(bufnr, M.ns, abs_line, info.byte, {
-									end_col = info.byte + info.char_len,
-									hl_group = "InlineDiffAddChange",
-									priority = 120,
-								})
-							end
-						end
+			local new_mask, chgd_new = build_change_mask(diffs, 3)
+			if chgd_new < #c_new then
+				local map = byte_map_for(s_new)
+				for k = 1, #c_new do
+					if new_mask[k] then
+						local info = map[k]
+						api.nvim_buf_set_extmark(bufnr, M.ns, buf_line_idx + i - 1, info.byte, {
+							end_col = info.byte + info.char_len,
+							hl_group = "InlineDiffAddChange",
+							priority = PRIORITY_CHANGE,
+						})
 					end
 				end
 			end
 		end
-
-		-- 4. Render Virtual Lines (with Padding)
-		local final_virt = {}
-		for _, chunks in ipairs(virts_old) do
-			table.insert(chunks, { padding_text, "InlineDiffDeleteContext" })
-			table.insert(final_virt, chunks)
-		end
-
-		if #final_virt > 0 then
-			api.nvim_buf_set_extmark(bufnr, M.ns, buf_line_idx, 0, {
-				virt_lines = final_virt,
-				virt_lines_above = true,
-			})
-		end
-
-		-- Advance
-		buf_line_idx = buf_line_idx + #p_new
-		p_old = {}
-		p_new = {}
 	end
-
-	for _, l in ipairs(hunk.lines) do
-		local pre, content = l:sub(1, 1), l:sub(2)
-		if pre == " " then
-			flush_change()
-			buf_line_idx = buf_line_idx + 1
-		elseif pre == "-" then
-			table.insert(p_old, content)
-		elseif pre == "+" then
-			table.insert(p_new, content)
-		end
-	end
-
-	flush_change()
 end
 
---------------------------------------------------------------------------------
--- 4. PUBLIC API
---------------------------------------------------------------------------------
+local function get_padding_text()
+	local win_width = vim.api.nvim_win_get_width(0)
+	local padding_length = math.min(math.max(win_width, MIN_PADDING_LENGTH), MAX_PADDING_LENGTH)
+	return string.rep(" ", padding_length)
+end
+
+local function flush_diff_group(bufnr, idx, old, new, padding)
+	if #old == 0 and #new == 0 then
+		return idx
+	end
+
+	local virts = {}
+	for i, line in ipairs(old) do
+		virts[i] = { { line, "InlineDiffDeleteContext" } }
+	end
+
+	for j = 0, #new - 1 do
+		api.nvim_buf_set_extmark(bufnr, M.ns, idx + j, 0, {
+			end_line = idx + j + 1,
+			hl_group = "InlineDiffAddContext",
+			hl_eol = true,
+			priority = PRIORITY_CONTEXT,
+		})
+	end
+
+	local buf_lines = #new > 0 and api.nvim_buf_get_lines(bufnr, idx, idx + #new, false) or {}
+	apply_char_highlights(bufnr, virts, old, new, idx, buf_lines)
+
+	if #virts > 0 then
+		local final = {}
+		for _, chunks in ipairs(virts) do
+			table.insert(chunks, { padding, "InlineDiffDeleteContext" })
+			table.insert(final, chunks)
+		end
+		api.nvim_buf_set_extmark(bufnr, M.ns, idx, 0, {
+			virt_lines = final,
+			virt_lines_above = true,
+		})
+	end
+
+	return idx + #new
+end
+
+local function render_hunk(bufnr, hunk)
+	local idx, old, new = hunk.new_start - 1, {}, {}
+	local padding = get_padding_text()
+
+	for _, l in ipairs(hunk.lines) do
+		local prefix, content = l:sub(1, 1), l:sub(2)
+		if prefix == DIFF_PREFIX.UNCHANGED then
+			idx = flush_diff_group(bufnr, idx, old, new, padding) + 1
+			old, new = {}, {}
+		elseif prefix == DIFF_PREFIX.DELETED then
+			table.insert(old, content)
+		elseif prefix == DIFF_PREFIX.ADDED then
+			table.insert(new, content)
+		end
+	end
+	flush_diff_group(bufnr, idx, old, new, padding)
+end
 
 M.refresh = function(bufnr)
 	bufnr = bufnr or api.nvim_get_current_buf()
-	if not M.enabled then
-		return
-	end
-
-	if not is_buffer_valid(bufnr) then
+	if not M.enabled or not is_buffer_valid(bufnr) then
 		return
 	end
 
 	run_git_diff(
 		bufnr,
 		vim.schedule_wrap(function(output)
-			-- Only redraw if the diff has actually changed for this buffer
 			if M.last_diff_buf == bufnr and output == M.last_diff_output then
 				return
 			end
 
-			-- Update cache for this buffer
-			M.last_diff_output = output
-			M.last_diff_buf = bufnr
-
+			M.last_diff_output, M.last_diff_buf = output, bufnr
 			api.nvim_buf_clear_namespace(bufnr, M.ns, 0, -1)
 
-			if not output or output == "" then
-				return
-			end
-			local hunks = parse_hunks(output)
-			for _, h in ipairs(hunks) do
-				render_hunk(bufnr, h)
+			if output then
+				for _, h in ipairs(parse_hunks(output)) do
+					render_hunk(bufnr, h)
+				end
 			end
 		end)
 	)
 end
 
-local debounce_timer = nil
-local augroup = nil
+local debounce_timer, augroup = nil, nil
 
-local function stop_debounce_timer()
+local function clear_cache(bufnr)
+	if not bufnr or M.last_diff_buf == bufnr then
+		M.last_diff_buf, M.last_diff_output = nil, nil
+	end
+end
+
+local function stop_timer()
 	if debounce_timer then
 		pcall(function()
 			debounce_timer:stop()
@@ -451,8 +355,8 @@ local function stop_debounce_timer()
 	end
 end
 
-local function start_debounce_timer(ms, cb)
-	stop_debounce_timer()
+local function start_timer(ms, cb)
+	stop_timer()
 	if not ms or ms == 0 then
 		return
 	end
@@ -461,7 +365,7 @@ local function start_debounce_timer(ms, cb)
 		ms,
 		0,
 		vim.schedule_wrap(function()
-			stop_debounce_timer()
+			stop_timer()
 			if cb then
 				cb()
 			end
@@ -473,76 +377,57 @@ local function setup_autocmds()
 	if augroup then
 		api.nvim_del_augroup_by_id(augroup)
 	end
-
 	augroup = api.nvim_create_augroup("InlineDiffAuto", { clear = true })
 
-	local function debounced_refresh()
-		local bufnr = api.nvim_get_current_buf()
-		if not is_buffer_valid(bufnr) then
-			return
-		end
-
-		if not M.enabled or (M.config.debounce_time or 0) == 0 then
-			M.refresh(bufnr)
-			return
-		end
-
-		start_debounce_timer(M.config.debounce_time, function()
-			if M.enabled then
-				M.refresh(bufnr)
-			end
-		end)
-	end
-
-	-- Trigger on text changes in normal mode, insert mode, and paste
 	api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "TextChangedP" }, {
 		group = augroup,
-		callback = debounced_refresh,
+		callback = function()
+			local bufnr = api.nvim_get_current_buf()
+			if not is_buffer_valid(bufnr) then
+				return
+			end
+
+			if not M.enabled or (M.config.debounce_time or 0) == 0 then
+				M.refresh(bufnr)
+			else
+				start_timer(M.config.debounce_time, function()
+					if M.enabled then
+						M.refresh(bufnr)
+					end
+				end)
+			end
+		end,
 	})
 
-	-- Clear cache when buffers unload or are deleted to avoid stale references
 	api.nvim_create_autocmd({ "BufUnload", "BufDelete" }, {
 		group = augroup,
 		callback = function(ctx)
-			local b = ctx.buf or ctx.bufnr
-			if M.last_diff_buf == b then
-				M.last_diff_buf = nil
-				M.last_diff_output = nil
-			end
+			clear_cache(ctx.buf or ctx.bufnr)
 		end,
 	})
 end
 
-local function clear_autocmds()
-	if augroup then
-		api.nvim_del_augroup_by_id(augroup)
-		augroup = nil
-	end
-	stop_debounce_timer()
-end
-
 function M.toggle()
+	M.enabled = not M.enabled
+	clear_cache()
+
 	if M.enabled then
-		M.enabled = false
-		M.last_diff_output = nil -- Clear cache on disable
-		M.last_diff_buf = nil
-		clear_autocmds()
-		-- Clear highlights/virt_lines in all loaded buffers
-		for _, b in ipairs(api.nvim_list_bufs()) do
-			if api.nvim_buf_is_loaded(b) then
-				pcall(api.nvim_buf_clear_namespace, b, M.ns, 0, -1)
-			end
-		end
-	else
-		M.enabled = true
-		M.last_diff_output = nil -- Clear cache on enable to force initial render
-		M.last_diff_buf = nil
-		-- Ensure highlights exist (avoid re-creating user command on every toggle)
 		if vim.fn.hlexists("InlineDiffAddContext") == 0 then
 			setup_highlights()
 		end
 		setup_autocmds()
 		M.refresh()
+	else
+		if augroup then
+			api.nvim_del_augroup_by_id(augroup)
+			augroup = nil
+		end
+		stop_timer()
+		for _, b in ipairs(api.nvim_list_bufs()) do
+			if api.nvim_buf_is_loaded(b) then
+				pcall(api.nvim_buf_clear_namespace, b, M.ns, 0, -1)
+			end
+		end
 	end
 end
 
@@ -550,36 +435,29 @@ M.setup = function(opts)
 	M.config = vim.tbl_deep_extend("force", M.default_config, opts or {})
 	setup_highlights()
 
-	-- Create user command `:InlineDiff [toggle|refresh]`
-	-- Only create the user command if it doesn't already exist
-	local cmds = api.nvim_get_commands({})
-	if not cmds["InlineDiff"] then
-		pcall(function()
-			api.nvim_create_user_command("InlineDiff", function(cmdopts)
-				local arg = (cmdopts.args or ""):match("^%s*(%S*)") or ""
-				if arg == "" or arg == "toggle" then
-					M.toggle()
-				elseif arg == "refresh" then
-					M.refresh()
-				else
-					print('InlineDiff: unknown arg "' .. arg .. '". Use "toggle" or "refresh"')
-				end
-			end, {
-				nargs = "?",
-				complete = function(ArgLead, _, _)
-					local opts = { "toggle", "refresh" }
-					local res = {}
-					for _, v in ipairs(opts) do
-						if v:sub(1, #ArgLead) == ArgLead then
-							table.insert(res, v)
-						end
+	if not api.nvim_get_commands({})["InlineDiff"] then
+		pcall(api.nvim_create_user_command, "InlineDiff", function(cmd)
+			local arg = (cmd.args or ""):match("^%s*(%S*)") or ""
+			if arg == "" or arg == "toggle" then
+				M.toggle()
+			elseif arg == "refresh" then
+				M.refresh()
+			else
+				print('InlineDiff: unknown arg "' .. arg .. '". Use "toggle" or "refresh"')
+			end
+		end, {
+			nargs = "?",
+			complete = function(lead)
+				local res = {}
+				for _, v in ipairs({ "toggle", "refresh" }) do
+					if v:sub(1, #lead) == lead then
+						table.insert(res, v)
 					end
-					return res
-				end,
-				desc = "InlineDiff commands: toggle or refresh",
-				-- force option not present in older neovim; using pcall wrapper to avoid errors
-			})
-		end)
+				end
+				return res
+			end,
+			desc = "InlineDiff commands: toggle or refresh",
+		})
 	end
 end
 
