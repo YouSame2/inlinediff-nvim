@@ -14,6 +14,8 @@ M.default_config = {
 		InlineDiffDeleteContext = "#240004",
 		InlineDiffDeleteChange = "#520005",
 	},
+	ignored_buftype = { "terminal", "nofile" },
+	ignored_filetype = { "TelescopePrompt", "NvimTree", "dap-repl", "neo-tree" },
 }
 M.config = vim.deepcopy(M.default_config)
 
@@ -30,25 +32,78 @@ local function setup_highlights()
 end
 
 -- UTF-8 Safe Split
-local function split_utf8(str)
-	local t = {}
-	for char in str:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
-		table.insert(t, char)
+-- UTF-8 helpers: build char arrays and compute byte offsets using Neovim API
+local function build_char_array(s)
+	local chars = {}
+	local n = vim.str_utfindex(s, "utf-8") or 0
+	for i = 0, n - 1 do
+		table.insert(chars, vim.fn.strcharpart(s, i, 1))
 	end
-	return t
+	return chars
 end
 
--- Map linear string indices to line/byte positions
--- (Simplified for single-line usage, but kept robust)
-local function map_indices(chars)
+local function byte_map_for(s)
 	local map = {}
-	local current_byte = 0
-	for _, char in ipairs(chars) do
-		table.insert(map, { byte = current_byte, char_len = #char })
-		current_byte = current_byte + #char
+	local n = vim.str_utfindex(s, "utf-8") or 0
+	for i = 0, n - 1 do
+		local start = vim.str_byteindex(s, "utf-8", i, false)
+		local finish = vim.str_byteindex(s, "utf-8", i + 1, false)
+		table.insert(map, { byte = start, char_len = finish - start })
 	end
 	return map
 end
+
+	-- Lightweight buffer validity predicate used to avoid expensive work on
+	-- non-file-ish buffers (terminals, help, plugin prompts, unloaded buffers).
+	local function is_buffer_valid(bufnr)
+		if not api.nvim_buf_is_valid(bufnr) then
+			return false
+		end
+
+		if not api.nvim_buf_is_loaded(bufnr) then
+			return false
+		end
+
+		-- Skip by buftype when non-empty (common special buffers). Also consult
+		-- user-supplied ignored_buftype for explicit matches.
+		local ok, buftype = pcall(api.nvim_buf_get_option, bufnr, 'buftype')
+		if ok and buftype and buftype ~= '' then
+			for _, v in ipairs(M.config.ignored_buftype or {}) do
+				if buftype == v then
+					return false
+				end
+			end
+			-- If buftype is non-empty treat as special and skip.
+			return false
+		end
+
+		-- Block common UI/plugin filetypes when listed in config
+		local ok2, ft = pcall(api.nvim_buf_get_option, bufnr, 'filetype')
+		if ok2 and ft and ft ~= '' then
+			for _, v in ipairs(M.config.ignored_filetype or {}) do
+				if ft == v then
+					return false
+				end
+			end
+		end
+
+		-- Prefer listed buffers; allow unnamed (new) buffers when listed and
+		-- modifiable (common for new unsaved buffers).
+		local ok3, bl = pcall(api.nvim_buf_get_option, bufnr, 'buflisted')
+		if not ok3 or not bl then
+			return false
+		end
+
+		local name = api.nvim_buf_get_name(bufnr)
+		if name == '' then
+			local ok4, mod = pcall(api.nvim_buf_get_option, bufnr, 'modifiable')
+			if not ok4 or not mod then
+				return false
+			end
+		end
+
+		return true
+	end
 
 --------------------------------------------------------------------------------
 -- 2. GIT SOURCE
@@ -230,8 +285,8 @@ local function render_hunk(bufnr, hunk)
 			local s_old = p_old[i]
 			-- Use actual buffer content for NEW lines
 			local s_new = buf_lines_new[i] or p_new[i]
-			local c_old = split_utf8(s_old)
-			local c_new = split_utf8(s_new)
+			local c_old = build_char_array(s_old)
+			local c_new = build_char_array(s_new)
 
 			if #c_old > 0 and #c_new > 0 then
 				local diffs = vim.diff(table.concat(c_old, "\n"), table.concat(c_new, "\n"), {
@@ -290,9 +345,9 @@ local function render_hunk(bufnr, hunk)
 
 					-- Only show Bright if NOT a full line replacement
 					if chgd_new < #c_new then
-						local map = map_indices(c_new)
+						local map = byte_map_for(s_new)
 						local abs_line = buf_line_idx + (i - 1)
-						for k, char in ipairs(c_new) do
+						for k = 1, #c_new do
 							if new_mask[k] then
 								local info = map[k]
 								api.nvim_buf_set_extmark(bufnr, M.ns, abs_line, info.byte, {
@@ -352,6 +407,10 @@ M.refresh = function(bufnr)
 		return
 	end
 
+	if not is_buffer_valid(bufnr) then
+		return
+	end
+
 	run_git_diff(
 		bufnr,
 		vim.schedule_wrap(function(output)
@@ -380,6 +439,32 @@ end
 local debounce_timer = nil
 local augroup = nil
 
+local function stop_debounce_timer()
+	if debounce_timer then
+		pcall(function()
+			debounce_timer:stop()
+			if not debounce_timer:is_closing() then
+				debounce_timer:close()
+			end
+		end)
+		debounce_timer = nil
+	end
+end
+
+local function start_debounce_timer(ms, cb)
+	stop_debounce_timer()
+	if not ms or ms == 0 then
+		return
+	end
+	debounce_timer = vim.loop.new_timer()
+	debounce_timer:start(ms, 0, vim.schedule_wrap(function()
+		stop_debounce_timer()
+		if cb then
+			cb()
+		end
+	end))
+end
+
 local function setup_autocmds()
 	if augroup then
 		api.nvim_del_augroup_by_id(augroup)
@@ -388,33 +473,21 @@ local function setup_autocmds()
 	augroup = api.nvim_create_augroup("InlineDiffAuto", { clear = true })
 
 	local function debounced_refresh()
-		if not M.enabled or (M.config.debounce_time or 0) == 0 then
+		local bufnr = api.nvim_get_current_buf()
+		if not is_buffer_valid(bufnr) then
 			return
 		end
 
-		if debounce_timer then
-			debounce_timer:stop()
-			if not debounce_timer:is_closing() then
-				debounce_timer:close()
-			end
+		if not M.enabled or (M.config.debounce_time or 0) == 0 then
+			M.refresh(bufnr)
+			return
 		end
 
-		debounce_timer = vim.loop.new_timer()
-		debounce_timer:start(
-			M.config.debounce_time,
-			0,
-			vim.schedule_wrap(function()
-				if debounce_timer then
-					if not debounce_timer:is_closing() then
-						debounce_timer:close()
-					end
-					debounce_timer = nil
-				end
-				if M.enabled then
-					M.refresh()
-				end
-			end)
-		)
+		start_debounce_timer(M.config.debounce_time, function()
+			if M.enabled then
+				M.refresh(bufnr)
+			end
+		end)
 	end
 
 	-- Trigger on text changes in normal mode, insert mode, and paste
@@ -441,13 +514,7 @@ local function clear_autocmds()
 		api.nvim_del_augroup_by_id(augroup)
 		augroup = nil
 	end
-	if debounce_timer then
-		debounce_timer:stop()
-		if not debounce_timer:is_closing() then
-			debounce_timer:close()
-		end
-		debounce_timer = nil
-	end
+	stop_debounce_timer()
 end
 
 function M.toggle()
